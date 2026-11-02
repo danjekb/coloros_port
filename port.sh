@@ -588,7 +588,7 @@ for i in $(find build/portrom/images -type f -name "build.prop");do
     sed -i "s/ro.oplus.radio.global_regionlock.enabled=.*/ro.oplus.radio.global_regionlock.enabled=false/g" ${i}
     sed -i "s/persist.sys.radio.global_regionlock.allcheck=.*/persist.sys.radio.global_regionlock.allcheck=false/g" ${i}
     sed -i "s/ro.oplus.radio.checkservice=.*/ro.oplus.radio.checkservice=false/g" ${i}
-    sed -i "s/ro.build.version.realmeui=.*/ro.build.version.realmeui=V6.0 | By Ashish/g" ${i}
+    sed -i "s/ro.build.version.realmeui=.*/ro.build.version.realmeui=V6.0 | By Dvnielek/g" ${i}
 done
 
 #sed -i -e '$a\'$'\n''persist.adb.notify=0' build/portrom/images/system/system/build.prop
