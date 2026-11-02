@@ -1,0 +1,262 @@
+name: Build ColorOS Port (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_rom_url:
+        description: 'Base ROM URL (ColorOS 14/15 official OTA zip for TARGET device)'
+        required: true
+        type: string
+      port_rom_url:
+        description: 'Port ROM URL (ColorOS 15/16 official OTA zip for DONOR device)'
+        required: true
+        type: string
+      device_codename:
+        description: 'Target device codename (for artifact naming)'
+        required: false
+        type: string
+        default: 'unknown'
+      pack_method:
+        description: 'Pack method: stock (OTA zip) or fastboot (super.zst + scripts)'
+        required: false
+        type: choice
+        options:
+          - stock
+          - fastboot
+        default: 'stock'
+      clean_disk:
+        description: 'Patch port.sh to free disk during build (recommended on free runners)'
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build Port for ${{ github.event.inputs.device_codename }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      # ============ FREE DISK SPACE ============
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 4096
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Show disk info
+        run: |
+          df -h /
+          nproc
+          free -h
+
+      # ============ CHECKOUT ============
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ============ SETUP PATH (use repo's prebuilt tools) ============
+      - name: Setup PATH with repo tools
+        run: |
+          echo "$(pwd)/bin/Linux/x86_64" >> $GITHUB_PATH
+          echo "$(pwd)/otatools/bin" >> $GITHUB_PATH
+          echo "$(pwd)/bin" >> $GITHUB_PATH
+          echo "PATH updated with repo tools"
+
+      # ============ INSTALL SYSTEM DEPENDENCIES (from setup.sh) ============
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            aria2 \
+            python3 python3-pip \
+            busybox \
+            zip unzip \
+            p7zip-full \
+            openjdk-21-jre-headless \
+            zstd \
+            bc \
+            xmlstarlet \
+            android-sdk-libsparse-utils \
+            binutils \
+            wget curl \
+            2>&1 | tail -10
+
+          # Verify critical tools (from port.sh check)
+          for tool in aria2c 7z zip unzip java python3 zstd bc xmlstarlet; do
+            command -v "$tool" >/dev/null && echo "✓ $tool" || { echo "✗ $tool MISSING"; exit 1; }
+          done
+
+          # Verify repo tools
+          for tool in payload-dumper payload-dumper-go lpmake magiskboot extract.erofs mkfs.erofs gettype brotli sdat2img.py; do
+            command -v "$tool" >/dev/null && echo "✓ $tool (from repo)" || echo "⚠ $tool not in PATH"
+          done
+
+          java -version 2>&1 | head -1
+
+      # ============ PATCH PORT.SH FOR CI DISK CLEANUP ============
+      - name: Patch port.sh for CI disk cleanup
+        if: ${{ inputs.clean_disk }}
+        run: |
+          python3 - <<'PY'
+          import sys
+          import subprocess
+
+          path = 'port.sh'
+          src = open(path, encoding='utf-8').read()
+
+          # 1) After both ROMs are unpacked (payload.bin extracted): drop the ROM zips
+          # Insert before "blue "正在清理文件" "Cleaning up..""
+          anchor1 = 'blue "正在清理文件" "Cleaning up.."'
+          patch1 = '''# CI_FREE_SPACE: both payloads extracted, drop ROM zips
+if [[ "${CI_FREE_SPACE:-false}" == "true" ]]; then
+    blue "CI_FREE_SPACE: dropping ROM zips"
+    [[ "${baserom}" != */* ]] && rm -f -- "${baserom}"
+    [[ "${portrom}" != */* ]] && rm -f -- "${portrom}"
+    df -h . | tail -n 1
+fi
+
+blue "正在清理文件" "Cleaning up.."'''
+
+          # 2) After extracting partitions from baserom: drop baserom images
+          anchor2 = 'green "文件清理完毕" "Files cleaned up."'
+          patch2 = '''green "文件清理完毕" "Files cleaned up."
+
+# CI_FREE_SPACE: drop baserom partition images after extraction
+if [[ "${CI_FREE_SPACE:-false}" == "true" ]]; then
+    blue "CI_FREE_SPACE: dropping baserom partition images"
+    rm -rf build/baserom/images/*.img
+    df -h . | tail -n 1
+fi'''
+
+          # 3) In the packing loop (after each partition is packed): drop the extracted tree
+          anchor3 = 'for part in ${super_list};do'
+          patch3 = '''for part in ${super_list};do
+# CI_FREE_SPACE: after packing each partition, drop its extracted tree
+if [[ "${CI_FREE_SPACE:-false}" == "true" ]] && [[ "${is_ab_device}" == "true" ]] && [[ "${part}" != "my_manifest" ]]; then
+    ci_tree="build/portrom/images/${part}"
+    ci_prop=$(find "$ci_tree" -type f -name build.prop -not -path "*/system_dlkm/*" -not -path "*/odm_dlkm/*" -print -quit 2>/dev/null)
+    if [[ -n "$ci_prop" ]]; then cp -f "$ci_prop" "$ci_tree/build.prop"; fi
+    find "$ci_tree" -mindepth 1 -maxdepth 1 ! -name build.prop -exec rm -rf {} + 2>/dev/null
+fi'''
+
+          # 4) After super.img is compressed to super.zst: drop super.img and partition images
+          anchor4 = 'zstd build/portrom/images/super.img -o build/portrom/super.zst'
+          patch4 = '''zstd build/portrom/images/super.img -o build/portrom/super.zst
+if [[ "${CI_FREE_SPACE:-false}" == "true" ]]; then
+    blue "CI_FREE_SPACE: dropping super.img and partition images"
+    rm -f build/portrom/images/super.img
+    for pname in ${super_list}; do rm -f "build/portrom/images/${pname}.img"; done
+    df -h . | tail -n 1
+fi'''
+
+          # Apply patches
+          for anchor, label, patch in [
+              (anchor1, 'after ROM validation', patch1),
+              (anchor2, 'after file cleanup', patch2),
+              (anchor3, 'packing loop start', patch3),
+              (anchor4, 'after super.zst', patch4),
+          ]:
+              count = src.count(anchor)
+              if count != 1:
+                  sys.exit(f'Patch {label}: anchor found {count} times (expected 1) - upstream changed')
+              src = src.replace(anchor, anchor + patch, 1)
+
+          # Switch pack_method if fastboot selected (modify bin/port_config at runtime)
+          # Note: port.sh reads pack_method from bin/port_config, so we'll handle this in the build step
+          # Use store compression (zip -0) for super.zst since it's already compressed
+          src = src.replace('zip -r ${os_type}_${rom_version}.zip', 'zip -0 -r ${os_type}_${rom_version}.zip')
+
+          open(path, 'w', encoding='utf-8').write(src)
+          subprocess.run(['bash', '-n', path], check=True)
+          print('port.sh patched for CI disk cleanup')
+          PY
+
+      # ============ CONFIGURE PACK METHOD ============
+      - name: Configure pack method
+        if: ${{ github.event.inputs.pack_method == 'fastboot' }}
+        run: |
+          echo "Setting pack_method=fastboot in bin/port_config"
+          sed -i 's/^pack_method=.*/pack_method=fastboot/' bin/port_config
+          grep '^pack_method=' bin/port_config
+
+# ============ MAKE SCRIPTS EXECUTABLE ============
+      - name: Make scripts executable
+        run: |
+          chmod +x port.sh setup.sh functions.sh bin/getSuperSize.sh
+          chmod +x bin/*.py 2>/dev/null || true
+          chmod +x bin/Linux/x86_64/* 2>/dev/null || true
+          chmod +x otatools/bin/* 2>/dev/null || true
+
+      # ============ RUN SETUP ============
+      - name: Run setup.sh
+        run: |
+          ./setup.sh 2>&1 | tail -20
+
+      # ============ RUN PORT SCRIPT ============
+      - name: Build port ROM
+        env:
+          CI_FREE_SPACE: ${{ inputs.clean_disk }}
+        run: |
+          echo "=== Starting port ==="
+          echo "Base ROM: ${{ github.event.inputs.base_rom_url }}"
+          echo "Port ROM: ${{ github.event.inputs.port_rom_url }}"
+          echo "Device: ${{ github.event.inputs.device_codename }}"
+          echo "Pack method: ${{ github.event.inputs.pack_method }}"
+          echo "CI_FREE_SPACE: $CI_FREE_SPACE"
+          start=$(date +%s)
+
+          ./port.sh "${{ github.event.inputs.base_rom_url }}" "${{ github.event.inputs.port_rom_url }}" 2>&1 | tee port.log
+
+          end=$(date +%s)
+          echo "=== Port completed in $(( (end - start) / 60 ))m $(( (end - start) % 60 ))s ==="
+
+      # ============ FIND & UPLOAD OUTPUT ============
+      - name: Find output ZIP
+        id: find-output
+        if: always()
+        run: |
+          # Search common output locations (both stock OTA and fastboot package)
+          ZIP=$(find output out build -name "*.zip" -type f 2>/dev/null | head -1)
+          if [[ -n "$ZIP" && -f "$ZIP" ]]; then
+            NAME=$(basename "$ZIP")
+            SIZE=$(stat -c%s "$ZIP")
+            echo "Found: $ZIP ($((SIZE/1024/1024)) MB)"
+            echo "zip_path=$ZIP" >> $GITHUB_OUTPUT
+            echo "zip_name=$NAME" >> $GITHUB_OUTPUT
+            unzip -l "$ZIP" | head -15
+          else
+            echo "No output ZIP found"
+            echo "zip_path=" >> $GITHUB_OUTPUT
+            echo "zip_name=" >> $GITHUB_OUTPUT
+            find output out build -type f 2>/dev/null | head -20
+          fi
+
+      - name: Upload artifact
+        if: success() && steps.find-output.outputs.zip_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: coloros-port-${{ github.event.inputs.device_codename }}-${{ github.run_number }}
+          path: ${{ steps.find-output.outputs.zip_path }}
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            port.log
+            build/**/*.log
+          retention-days: 3
+
+      - name: Final disk usage
+        if: always()
+        run: df -h /
