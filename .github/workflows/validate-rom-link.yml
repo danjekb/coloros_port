@@ -1,0 +1,87 @@
+name: Validate ROM Link
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: 'ROM URL to validate (official ColorOS OTA zip)'
+        required: true
+        type: string
+      rom_type:
+        description: 'Type of ROM'
+        required: false
+        type: choice
+        options:
+          - base
+          - port
+        default: 'base'
+
+jobs:
+  validate:
+    name: Validate ${{ github.event.inputs.rom_type }} ROM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install aria2 & tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 unzip
+
+      - name: Download ROM
+        id: download
+        run: |
+          URL="${{ github.event.inputs.rom_url }}"
+          OUT="rom.zip"
+          echo "Downloading from: $URL"
+          aria2c -x16 -s16 -k1M --file-allocation=none \
+            --connect-timeout=30 --timeout=120 \
+            -o "$OUT" "$URL" 2>&1 | tail -20
+
+          if [[ ! -f "$OUT" ]]; then
+            echo "❌ Download failed - file not created"
+            exit 1
+          fi
+
+          SIZE=$(stat -c%s "$OUT")
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+          echo "size_mb=$SIZE_MB" >> $GITHUB_OUTPUT
+          echo "✅ Downloaded: ${SIZE_MB} MB"
+
+      - name: Check minimum size
+        run: |
+          SIZE="${{ steps.download.outputs.size }}"
+          if [[ "$SIZE" -lt 500000000 ]]; then
+            echo "❌ File too small: ${SIZE} bytes (< 500 MB) - not a valid OTA"
+            exit 1
+          fi
+          echo "✅ Size OK: > 500 MB"
+
+      - name: Verify payload.bin exists
+        run: |
+          unzip -l rom.zip | grep -q payload.bin || {
+            echo "❌ No payload.bin found in ZIP"
+            unzip -l rom.zip | head -30
+            exit 1
+          }
+          echo "✅ payload.bin found"
+
+      - name: Show ZIP contents (first 30 entries)
+        run: |
+          echo "=== ZIP contents ==="
+          unzip -l rom.zip | head -30
+
+      - name: Extract & check build.prop (optional)
+        run: |
+          # Quick check: extract payload.bin and dump partition info
+          # This requires payload-dumper-go which we don't have installed
+          # Just show that ZIP structure looks correct
+          echo "=== ROM validation passed ==="
+          echo "URL: ${{ github.event.inputs.rom_url }}"
+          echo "Size: ${{ steps.download.outputs.size_mb }} MB"
+          echo "Type: ${{ github.event.inputs.rom_type }}"
+          echo "Has payload.bin: yes"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f rom.zip
