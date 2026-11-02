@@ -68,7 +68,7 @@ jobs:
           echo "$(pwd)/bin" >> $GITHUB_PATH
           echo "PATH updated with repo tools"
 
-      # ============ INSTALL SYSTEM DEPENDENCIES (from setup.sh) ============
+      # ============ INSTALL SYSTEM DEPENDENCIES ============
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -101,19 +101,18 @@ jobs:
 
       # ============ PATCH PORT.SH FOR CI DISK CLEANUP ============
       - name: Patch port.sh for CI disk cleanup
-        if: ${{ inputs.clean_disk }}
+        if: inputs.clean_disk == 'true'
         run: |
           python3 - <<'PY'
-          import sys
-          import subprocess
+import sys
+import subprocess
 
-          path = 'port.sh'
-          src = open(path, encoding='utf-8').read()
+path = 'port.sh'
+src = open(path, encoding='utf-8').read()
 
-          # 1) After both ROMs are unpacked (payload.bin extracted): drop the ROM zips
-          # Insert before "blue "正在清理文件" "Cleaning up..""
-          anchor1 = 'blue "正在清理文件" "Cleaning up.."'
-          patch1 = '''# CI_FREE_SPACE: both payloads extracted, drop ROM zips
+# 1) After both ROMs are unpacked (payload.bin extracted): drop the ROM zips
+anchor1 = 'blue "正在清理文件" "Cleaning up.."'
+patch1 = '''# CI_FREE_SPACE: both payloads extracted, drop ROM zips
 if [[ "${CI_FREE_SPACE:-false}" == "true" ]]; then
     blue "CI_FREE_SPACE: dropping ROM zips"
     [[ "${baserom}" != */* ]] && rm -f -- "${baserom}"
@@ -123,9 +122,9 @@ fi
 
 blue "正在清理文件" "Cleaning up.."'''
 
-          # 2) After extracting partitions from baserom: drop baserom images
-          anchor2 = 'green "文件清理完毕" "Files cleaned up."'
-          patch2 = '''green "文件清理完毕" "Files cleaned up."
+# 2) After extracting partitions from baserom: drop baserom images
+anchor2 = 'green "文件清理完毕" "Files cleaned up."'
+patch2 = '''green "文件清理完毕" "Files cleaned up."
 
 # CI_FREE_SPACE: drop baserom partition images after extraction
 if [[ "${CI_FREE_SPACE:-false}" == "true" ]]; then
@@ -134,9 +133,9 @@ if [[ "${CI_FREE_SPACE:-false}" == "true" ]]; then
     df -h . | tail -n 1
 fi'''
 
-          # 3) In the packing loop (after each partition is packed): drop the extracted tree
-          anchor3 = 'for part in ${super_list};do'
-          patch3 = '''for part in ${super_list};do
+# 3) In the packing loop (after each partition is packed): drop the extracted tree
+anchor3 = 'for part in ${super_list};do'
+patch3 = '''for part in ${super_list};do
 # CI_FREE_SPACE: after packing each partition, drop its extracted tree
 if [[ "${CI_FREE_SPACE:-false}" == "true" ]] && [[ "${is_ab_device}" == "true" ]] && [[ "${part}" != "my_manifest" ]]; then
     ci_tree="build/portrom/images/${part}"
@@ -145,9 +144,9 @@ if [[ "${CI_FREE_SPACE:-false}" == "true" ]] && [[ "${is_ab_device}" == "true" ]
     find "$ci_tree" -mindepth 1 -maxdepth 1 ! -name build.prop -exec rm -rf {} + 2>/dev/null
 fi'''
 
-          # 4) After super.img is compressed to super.zst: drop super.img and partition images
-          anchor4 = 'zstd build/portrom/images/super.img -o build/portrom/super.zst'
-          patch4 = '''zstd build/portrom/images/super.img -o build/portrom/super.zst
+# 4) After super.img is compressed to super.zst: drop super.img and partition images
+anchor4 = 'zstd build/portrom/images/super.img -o build/portrom/super.zst'
+patch4 = '''zstd build/portrom/images/super.img -o build/portrom/super.zst
 if [[ "${CI_FREE_SPACE:-false}" == "true" ]]; then
     blue "CI_FREE_SPACE: dropping super.img and partition images"
     rm -f build/portrom/images/super.img
@@ -155,37 +154,35 @@ if [[ "${CI_FREE_SPACE:-false}" == "true" ]]; then
     df -h . | tail -n 1
 fi'''
 
-          # Apply patches
-          for anchor, label, patch in [
-              (anchor1, 'after ROM validation', patch1),
-              (anchor2, 'after file cleanup', patch2),
-              (anchor3, 'packing loop start', patch3),
-              (anchor4, 'after super.zst', patch4),
-          ]:
-              count = src.count(anchor)
-              if count != 1:
-                  sys.exit(f'Patch {label}: anchor found {count} times (expected 1) - upstream changed')
-              src = src.replace(anchor, anchor + patch, 1)
+# Apply patches
+for anchor, label, patch in [
+    (anchor1, 'after ROM validation', patch1),
+    (anchor2, 'after file cleanup', patch2),
+    (anchor3, 'packing loop start', patch3),
+    (anchor4, 'after super.zst', patch4),
+]:
+    count = src.count(anchor)
+    if count != 1:
+        sys.exit(f'Patch {label}: anchor found {count} times (expected 1) - upstream changed')
+    src = src.replace(anchor, anchor + patch, 1)
 
-          # Switch pack_method if fastboot selected (modify bin/port_config at runtime)
-          # Note: port.sh reads pack_method from bin/port_config, so we'll handle this in the build step
-          # Use store compression (zip -0) for super.zst since it's already compressed
-          src = src.replace('zip -r ${os_type}_${rom_version}.zip', 'zip -0 -r ${os_type}_${rom_version}.zip')
+# Use store compression (zip -0) for super.zst since it's already compressed
+src = src.replace('zip -r ${os_type}_${rom_version}.zip', 'zip -0 -r ${os_type}_${rom_version}.zip')
 
-          open(path, 'w', encoding='utf-8').write(src)
-          subprocess.run(['bash', '-n', path], check=True)
-          print('port.sh patched for CI disk cleanup')
-          PY
+open(path, 'w', encoding='utf-8').write(src)
+subprocess.run(['bash', '-n', path], check=True)
+print('port.sh patched for CI disk cleanup')
+PY
 
       # ============ CONFIGURE PACK METHOD ============
       - name: Configure pack method
-        if: ${{ github.event.inputs.pack_method == 'fastboot' }}
+        if: github.event.inputs.pack_method == 'fastboot'
         run: |
           echo "Setting pack_method=fastboot in bin/port_config"
           sed -i 's/^pack_method=.*/pack_method=fastboot/' bin/port_config
           grep '^pack_method=' bin/port_config
 
-# ============ MAKE SCRIPTS EXECUTABLE ============
+      # ============ MAKE SCRIPTS EXECUTABLE ============
       - name: Make scripts executable
         run: |
           chmod +x port.sh setup.sh functions.sh bin/getSuperSize.sh
